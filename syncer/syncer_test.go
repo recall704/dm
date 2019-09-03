@@ -98,7 +98,7 @@ type MockStreamProducer struct {
 	events []*replication.BinlogEvent
 }
 
-func (mp *MockStreamProducer) generateStreamer(pos mysql.Position) (streamer2.Streamer, error) {
+func (mp *MockStreamProducer) generateStreamer(pos mysql.Position, gtid string, flavor string) (streamer2.Streamer, error) {
 	if pos.Pos == 4 {
 		return &MockStreamer{mp.events, 0}, nil
 	}
@@ -939,7 +939,7 @@ func (s *testSyncerSuite) TestGeneratedColumn(c *C) {
 	syncer.toDBs = []*Conn{{baseConn: &baseconn.BaseConn{db, "", &retry.FiniteRetryStrategy{}}}}
 	syncer.reset()
 
-	streamer, err := syncer.streamerProducer.generateStreamer(pos)
+	streamer, err := syncer.streamerProducer.generateStreamer(pos, "", "mysql")
 	c.Assert(err, IsNil)
 
 	for _, testCase := range testCases {

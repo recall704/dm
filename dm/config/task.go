@@ -59,10 +59,10 @@ var (
 
 // Meta represents binlog's meta pos
 // NOTE: refine to put these config structs into pkgs
-// NOTE: now, syncer does not support GTID mode and which is supported by relay
 type Meta struct {
 	BinLogName string `yaml:"binlog-name"`
 	BinLogPos  uint32 `yaml:"binlog-pos"`
+	BinLogGTID string `yaml:"binlog-gtid"`
 }
 
 // Verify does verification on configs

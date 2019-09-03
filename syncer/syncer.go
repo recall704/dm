@@ -87,7 +87,7 @@ const (
 // For other implementations who implement StreamerProducer and Streamer can easily take place of Syncer.streamProducer
 // For test is easy to mock
 type StreamerProducer interface {
-	generateStreamer(pos mysql.Position) (streamer.Streamer, error)
+	generateStreamer(pos mysql.Position, gtid string, flavor string) (streamer.Streamer, error)
 }
 
 // Read local relay log
@@ -95,7 +95,7 @@ type localBinlogReader struct {
 	reader *streamer.BinlogReader
 }
 
-func (l *localBinlogReader) generateStreamer(pos mysql.Position) (streamer.Streamer, error) {
+func (l *localBinlogReader) generateStreamer(pos mysql.Position, _, _ string) (streamer.Streamer, error) {
 	return l.reader.StartSync(pos)
 }
 
@@ -104,9 +104,10 @@ type remoteBinlogReader struct {
 	reader     *replication.BinlogSyncer
 	tctx       *tcontext.Context
 	EnableGTID bool
+	BinLogGTID string
 }
 
-func (r *remoteBinlogReader) generateStreamer(pos mysql.Position) (streamer.Streamer, error) {
+func (r *remoteBinlogReader) generateStreamer(pos mysql.Position, gtid, flavor string) (streamer.Streamer, error) {
 	defer func() {
 		lastSlaveConnectionID := r.reader.LastConnectionID()
 		r.tctx.L().Info("last slave connection", zap.Uint32("connection ID", lastSlaveConnectionID))
@@ -114,6 +115,15 @@ func (r *remoteBinlogReader) generateStreamer(pos mysql.Position) (streamer.Stre
 	if r.EnableGTID {
 		// NOTE: our (per-table based) checkpoint does not support GTID yet
 		return nil, terror.ErrSyncerUnitRemoteSteamerWithGTID.Generate()
+	}
+
+	if r.EnableGTID {
+		gtidSet, err := mysql.ParseGTIDSet(flavor, gtid)
+		if err != nil {
+			return nil, terror.ErrParseGTID.Delegate(err)
+		}
+		streamer, err := r.reader.StartSyncGTID(gtidSet)
+		return streamer, terror.ErrSyncerUnitRemoteSteamerStartSync.Delegate(err)
 	}
 
 	streamer, err := r.reader.StartSync(pos)
@@ -478,7 +488,7 @@ func (s *Syncer) resetReplicationSyncer() {
 	// re-create new streamerProducer
 	switch s.binlogType {
 	case RemoteBinlog:
-		s.streamerProducer = &remoteBinlogReader{replication.NewBinlogSyncer(s.syncCfg), s.tctx, s.cfg.EnableGTID}
+		s.streamerProducer = &remoteBinlogReader{replication.NewBinlogSyncer(s.syncCfg), s.tctx, s.cfg.EnableGTID, s.cfg.Meta.BinLogGTID}
 	case LocalBinlog:
 		s.streamerProducer = &localBinlogReader{streamer.NewBinlogReader(s.tctx, &streamer.BinlogReaderConfig{RelayDir: s.cfg.RelayDir, Timezone: s.timezone})}
 	default:
@@ -1004,7 +1014,7 @@ func (s *Syncer) redirectStreamer(pos mysql.Position) error {
 	var err error
 	s.tctx.L().Info("reset global streamer", zap.Stringer("position", pos))
 	s.resetReplicationSyncer()
-	s.streamer, err = s.streamerProducer.generateStreamer(pos)
+	s.streamer, err = s.streamerProducer.generateStreamer(pos, s.cfg.Meta.BinLogGTID, s.cfg.Flavor)
 	return err
 }
 
@@ -1042,7 +1052,7 @@ func (s *Syncer) Run(ctx context.Context) (err error) {
 	)
 	s.tctx.L().Info("replicate binlog from checkpoint", zap.Stringer("checkpoint", lastPos))
 
-	s.streamer, err = s.streamerProducer.generateStreamer(lastPos)
+	s.streamer, err = s.streamerProducer.generateStreamer(lastPos, s.cfg.Meta.BinLogGTID, s.cfg.Flavor)
 	if err != nil {
 		return err
 	}
@@ -1218,7 +1228,7 @@ func (s *Syncer) Run(ctx context.Context) (err error) {
 		if err != nil {
 			s.tctx.L().Error("fail to fetch binlog", log.ShortError(err))
 			// try to re-sync in gtid mode
-			if tryReSync && s.cfg.EnableGTID && isBinlogPurgedError(err) && s.cfg.AutoFixGTID {
+			if tryReSync && s.cfg.EnableGTID && utils.IsErrBinlogPurged(err) && s.cfg.AutoFixGTID {
 				time.Sleep(retryTimeout)
 				err = s.reSyncBinlog(s.syncCfg)
 				if err != nil {
@@ -2102,8 +2112,8 @@ func (s *Syncer) reopen(cfg replication.BinlogSyncerConfig) (streamer.Streamer, 
 		}
 	}
 	// TODO: refactor to support relay
-	s.streamerProducer = &remoteBinlogReader{replication.NewBinlogSyncer(cfg), s.tctx, s.cfg.EnableGTID}
-	return s.streamerProducer.generateStreamer(s.checkpoint.GlobalPoint())
+	s.streamerProducer = &remoteBinlogReader{replication.NewBinlogSyncer(cfg), s.tctx, s.cfg.EnableGTID, s.cfg.Meta.BinLogGTID}
+	return s.streamerProducer.generateStreamer(s.checkpoint.GlobalPoint(), s.cfg.Meta.BinLogGTID, s.cfg.Flavor)
 }
 
 func (s *Syncer) renameShardingSchema(schema, table string) (string, string) {
@@ -2356,9 +2366,12 @@ func (s *Syncer) needResync() bool {
 // assume that reset master before switching to new master, and only the new master would write
 // it's a weak function to try best to fix gtid set while switching master/slave
 func (s *Syncer) retrySyncGTIDs() error {
-	// NOTE: our (per-table based) checkpoint does not support GTID yet, implement it if needed
-	s.tctx.L().Warn("our (per-table based) checkpoint does not support GTID yet")
-	return nil
+	var (
+		err     error
+		lastPos = s.checkpoint.GlobalPoint()
+	)
+	s.streamer, err = s.streamerProducer.generateStreamer(lastPos, s.cfg.Meta.BinLogGTID, s.cfg.Flavor)
+	return err
 }
 
 // checkpointID returns ID which used for checkpoint table
